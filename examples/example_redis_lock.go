@@ -79,8 +79,8 @@ func main(){
 	for i := 0; i < 1000; i++{
 		wg.Add(1)
 		go func() {
-			_ = handleFlashSale(ctx, rdb)
 			defer wg.Done()
+			_ = handleFlashSale(ctx, rdb)
 		}()
 	}
 	wg.Wait()
