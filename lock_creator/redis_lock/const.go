@@ -29,7 +29,7 @@ var(
 	scriptReleaseLock = redis.NewScript(luaReleaseLock)
 	scriptRenewalLock = redis.NewScript(luaRenewalLock)
 	scriptQueueUp = redis.NewScript(luaQueueUp)
-	scriptReJoin = redis.NewScript(luaAcquireLockAfterReceivingNotification)
+	scriptReJoin = redis.NewScript(luaReAcquireLock)
 )
 
 var(
@@ -46,17 +46,19 @@ var(
 
 	-- Publish messages to subscribers in the queue
 	local publish_count = 0
-	while(publish_count < 3)
+	while(publish_count < 5)
 	do
 		local tempToken = redis.call('lpop', KEYS[2])
-		if(not tempToken) then 
+		if not tempToken then 
 			break
 		end
 
 		if redis.call('get', tempToken) == tempToken then
 			redis.call('del', tempToken)
-			if redis.call('publish', tempToken, tempToken) == 1 then
-				publish_count = publish_count + 1
+			if tempToken ~= ARGV[1] then
+				if redis.call('publish', tempToken, 1) == 1 then
+					publish_count = publish_count + 1
+				end
 			end
 		end
 	end
@@ -82,7 +84,9 @@ var(
 	return redis.call('rpush', KEYS[2], KEYS[1])
 	`
 
-	luaAcquireLockAfterReceivingNotification = `
+	luaReAcquireLock = `
+	redis.call('del', ARGV[1])
+	redis.call('lrem', KEYS[2], 0, ARGV[1])
 	-- 获取锁
 	if (redis.call('set', KEYS[1], ARGV[1], 'nx', 'PX', ARGV[2])) then
 		return 1

@@ -19,9 +19,10 @@ func handleFlashSaleWithRedisDistributedLock(ctx context.Context, creator godisl
 	///////////////////////////////////////	use lock ///////////////////////////////////////////
 
 	ttl := time.Duration(30) * time.Second
-	waitTimeOut := time.Duration(3) * time.Second
+	waitTimeOut := time.Duration(20) * time.Second
 	lck, err := creator.Acquire(ctx, ttl, waitTimeOut)
 	if err != nil{
+		println(err.Error())
 		return err			// get lock fail or timeout
 	}
 	defer lck.Release(ctx)	// release before return
@@ -31,6 +32,7 @@ func handleFlashSaleWithRedisDistributedLock(ctx context.Context, creator godisl
 	////////////////////////////////////////////////////////////////////////////////////////////
 	////////////////////////////////////////////////////////////////////////////////////////////
 
+	//time.Sleep(10 * time.Millisecond)
 	// do something
 	return handleFlashSale(ctx, rdb)
 }
@@ -62,7 +64,7 @@ func main(){
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "",
-		DB:       2,
+		DB:       6,
 	})
 	creator, err := godislock.CreateRedisLockCreator(ctx, lockName, rdb)
 	if err != nil{
@@ -72,11 +74,12 @@ func main(){
 	////////////////////////////////////////////////////////////////////////////////////////////
 	////////////////////////////////////////////////////////////////////////////////////////////
 
+	wg := sync.WaitGroup{}
 
 	// 不使用分布式锁，在高并发场景下必然出现超卖
 	rdb.Set(ctx, productStockQuantity, 200, 1*time.Hour)
-	wg := sync.WaitGroup{}
-	for i := 0; i < 1000; i++{
+
+	for i := 0; i < 5000; i++{
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -85,17 +88,17 @@ func main(){
 	}
 	wg.Wait()
 	println("-------------------------------- 不使用分布式锁，在高并发场景下必然出现超卖 --------------------------------")
-	println("---------------------------------------------- 等待3秒 ----------------------------------------------")
-	time.Sleep(3*time.Second)
+	println("---------------------------------------------- 等待1秒 ----------------------------------------------")
+	time.Sleep(1*time.Second)
 
 
 	// 使用分布式锁可避免超卖
 	rdb.Set(ctx, productStockQuantity, 200, 1*time.Hour)
-	for i := 0; i < 2000; i++{
+	for i := 0; i < 5000; i++{
 		wg.Add(1)
 		go func() {
-			_ = handleFlashSaleWithRedisDistributedLock(ctx, creator, rdb)
 			defer wg.Done()
+			_ = handleFlashSaleWithRedisDistributedLock(ctx, creator, rdb)
 		}()
 	}
 	wg.Wait()

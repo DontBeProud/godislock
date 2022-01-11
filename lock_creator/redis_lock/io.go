@@ -41,16 +41,19 @@ func Acquire(ctx context.Context, rdb *redis.Client, lockName string, uuid strin
 		}
 	}()
 
+	activeClock := time.Tick(500 * time.Millisecond)
 	for{
 		select {
 		case <- clock:
 			return LockErrorRedisTimeOut
-		case msg := <- sub.Channel():
-			if msg.Payload != uuid{
-				continue
-			}
+		case <- activeClock:
 			// 再次获取锁
-			if err = reAcquire(ctx, rdb, lockName, uuid, ttl, deadline); err != LockErrorRedisLockBlocked {
+			if err = reAcquire(ctx, rdb, lockName, uuid, ttl, deadline); err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
+				return err
+			}
+		case <- sub.Channel():
+			// 再次获取锁
+			if err = reAcquire(ctx, rdb, lockName, uuid, ttl, deadline); err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
 				return err
 			}
 		}
@@ -119,6 +122,8 @@ func queueUp(ctx context.Context, rdb *redis.Client, lockName string, uuid strin
 		return errors.New(LockErrorRedisQueueUpFail.Error() + err.Error())
 	}
 	switch code {
+	case 1:
+		return nil
 	case 0:
 		return LockErrorRedisQueueUpFail
 	case -1:
