@@ -16,8 +16,17 @@ type LockCreatorInterface interface {
 	Acquire(ctx context.Context, ttl time.Duration, waitTimeOut time.Duration) (LockInterface, error)
 }
 
-func CreateRedisLockCreator(ctx context.Context, lockName string, rDb *redis.Client) (LockCreatorInterface, error){
-	return generateLockCreator(ctx, lockName, &LockCreatorRedis{
+type RedisLockCreator struct {
+	LockCreatorInterface
+}
+
+func CreateRedisLockCreator(ctx context.Context, lockName string, rDb *redis.Client) (*RedisLockCreator, error){
+	c, err := generateLockCreator(ctx, lockName, &LockCreatorRedis{
 		Rdb: rDb,
 	})
+	if err == nil{
+		return &RedisLockCreator{c}, nil
+	}
+
+	return nil, err
 }
