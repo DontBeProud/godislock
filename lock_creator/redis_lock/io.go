@@ -4,64 +4,36 @@ import (
 	"context"
 	"errors"
 	"github.com/go-redis/redis/v8"
+	"sync"
 	"time"
 )
 
 func Acquire(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration, timeOut time.Duration) error{
+
 	// try to acquire lock
-	success, err := rdb.SetNX(ctx, generateLockName(&lockName), uuid, ttl).Result()
-	if success{
+	if success, err := rdb.SetNX(ctx, generateLockName(&lockName), uuid, ttl).Result(); success{
 		return nil
+	}else if err != nil {
+		return errors.New(LockErrorRedisLockAcquireFail.Error() + err.Error())			// fatal error
 	}
 
-	// fatal error
-	if err != nil {
-		return errors.New(LockErrorRedisLockAcquireFail.Error() + err.Error())
-	}
+	wg := sync.WaitGroup{}
+	quitChan := make(chan bool)
+	resChan := make(chan error)
 
-	// subscribe redis and wait for notification
-	sub := rdb.Subscribe(ctx, uuid)
-	if sub == nil{
-		return LockErrorRedisSubScribeError
-	}
-	defer sub.Close()
+	// timed execute
+	go executeTimedTask(ctx, rdb, lockName, uuid, ttl, &wg, timeOut, quitChan, resChan)
+	// subscribe
+	go acquireBySubscribeQueue(ctx, rdb, lockName, uuid, ttl, &wg, timeOut, quitChan, resChan)
 
-	// queue up
-	clock := time.Tick(timeOut)
-	deadline := time.Now().Add(timeOut)
-	if err = queueUp(ctx, rdb, lockName, uuid, deadline); err != nil{
-		return err
-	}
-
-	// clear
-	defer func() {
-		if err != nil{
-			rdb.LRem(ctx, generateLockQueueName(&lockName), 0, uuid)
-			rdb.Del(ctx, uuid)
-		}
-	}()
-
-	activeClock := time.Tick(500 * time.Millisecond)
-	for{
-		select {
-		case <- clock:
-			return LockErrorRedisTimeOut
-		case <- activeClock:
-			// 再次获取锁
-			if err = reAcquire(ctx, rdb, lockName, uuid, ttl, deadline); err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
-				return err
-			}
-		case <- sub.Channel():
-			// 再次获取锁
-			if err = reAcquire(ctx, rdb, lockName, uuid, ttl, deadline); err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
-				return err
-			}
-		}
-	}
+	res := <-resChan
+	close(quitChan)
+	wg.Wait()
+	return res
 }
 
 func Refresh(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration) error{
-	code, err := scriptRenewalLock.Run(ctx, rdb, []string{generateLockName(&lockName)}, uuid, ttl.Milliseconds()).Int64()
+	code, err := scriptRefreshLock.Run(ctx, rdb, []string{generateLockName(&lockName)}, uuid, ttl.Milliseconds()).Int64()
 	if err != nil{
 		return LockErrorRedisRenewalProcedure
 	}
@@ -76,7 +48,7 @@ func Refresh(ctx context.Context, rdb *redis.Client, lockName string, uuid strin
 }
 
 func Release(ctx context.Context, rdb *redis.Client, lockName string, uuid string) error{
-	code, err := scriptReleaseLock.Run(ctx, rdb, []string{generateLockName(&lockName), generateLockQueueName(&lockName)}, uuid).Int64()
+	code, err := scriptReleaseLock.Run(ctx, rdb, []string{generateLockQueueName(&lockName), generateLockName(&lockName)}, uuid).Int64()
 	if err != nil{
 		return errors.New(LockErrorRedisReleaseProcedure.Error() + err.Error())
 	}
@@ -100,11 +72,92 @@ func CheckConnection(ctx context.Context, rdb *redis.Client) error{
 	return nil
 }
 
+func executeTimedTask(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration, wg *sync.WaitGroup, timeOut time.Duration, quitChan chan bool, resChan chan error){
+	wg.Add(1)
+	defer wg.Done()
+	timeOutClock := time.Tick(timeOut)
+	activeAcquireClock := time.Tick(300 * time.Millisecond)
+	for{
+		select {
+		case <- quitChan:
+			return
+		case <- timeOutClock:
+			rdb.Del(ctx, uuid)
+			resChan <- LockErrorRedisTimeOut
+			return
+		case <-activeAcquireClock:
+			err := activeAcquire(ctx, rdb, lockName, uuid, ttl)
+			if err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
+				resChan <- err
+				return
+			}
+		}
+	}
+}
+
+func acquireBySubscribeQueue(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration, wg *sync.WaitGroup, timeOut time.Duration, quitChan chan bool, resChan chan error){
+	wg.Add(1)
+	defer wg.Done()
+
+	queueSyncChan := make(chan error)
+	deadline := time.Now().Add(timeOut)
+	go func() {
+		if deadline.UnixNano() > time.Now().UnixNano(){
+			success, err := rdb.SetNX(ctx, uuid, uuid, deadline.Sub(time.Now())).Result()
+			if err != nil || success{
+				queueSyncChan <- err
+			}else {
+				queueSyncChan <- LockErrorRedisQueueUpFail
+			}
+		}else {
+			queueSyncChan <- LockErrorRedisTimeOut
+		}
+	}()
+
+	// subscribe redis and wait for notification
+	sub := rdb.Subscribe(ctx, uuid)
+	if sub == nil{
+		resChan <- LockErrorRedisSubScribeError
+		return
+	}
+	defer sub.Close()
+
+	if qErr := <- queueSyncChan; qErr != nil{
+		resChan <- qErr
+		return
+	}
+
+	if pErr := rdb.RPush(ctx, generateLockQueueName(&lockName), uuid).Err(); pErr != nil{
+		resChan <- pErr
+		return
+	}
+
+	for{
+		select {
+		case <- quitChan:
+			return
+		case <- sub.Channel():
+			// 再次获取锁
+			err := reAcquire(ctx, rdb, lockName, uuid, ttl, deadline)
+			if err == nil || err.Error() != LockErrorRedisLockBlocked.Error() {
+				resChan <- err
+				return
+			}
+		}
+	}
+}
+
 func reAcquire(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration, deadline time.Time) error{
+	if deadline.UnixNano() <= time.Now().UnixNano(){
+		return LockErrorRedisTimeOut
+	}
+
 	code, err := scriptReJoin.Run(ctx, rdb, []string{generateLockName(&lockName), generateLockQueueName(&lockName)}, uuid, ttl.Milliseconds(), deadline.UnixMilli() - time.Now().UnixMilli()).Int64()
+
 	if err != nil {
 		return errors.New(LockErrorRedisLockAcquireFail.Error() + err.Error())
 	}
+
 	switch code {
 	case 0:
 		return LockErrorRedisLockBlocked
@@ -116,19 +169,13 @@ func reAcquire(ctx context.Context, rdb *redis.Client, lockName string, uuid str
 	return nil
 }
 
-func queueUp(ctx context.Context, rdb *redis.Client, lockName string, uuid string, deadline time.Time) error{
-	code, err := scriptQueueUp.Run(ctx, rdb, []string{uuid, generateLockQueueName(&lockName)}, deadline.UnixMilli() - time.Now().UnixMilli()).Int64()
+func activeAcquire(ctx context.Context, rdb *redis.Client, lockName string, uuid string, ttl time.Duration) error{
+	res, err := scriptActiveAcquire.Run(ctx, rdb, []string{generateLockName(&lockName)}, uuid, ttl.Milliseconds()).Int64()
 	if err != nil{
-		return errors.New(LockErrorRedisQueueUpFail.Error() + err.Error())
+		return errors.New(LockErrorRedisActiveAcquire.Error() + err.Error())
 	}
-	switch code {
-	case 1:
-		return nil
-	case 0:
-		return LockErrorRedisQueueUpFail
-	case -1:
-		return errors.New(LockErrorRedisQueueUpFail.Error() + "set fail")
+	if res == 0{
+		return LockErrorRedisLockBlocked
 	}
 	return nil
 }
-

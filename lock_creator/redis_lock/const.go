@@ -18,6 +18,7 @@ var(
 	LockErrorRedisRenewalProcedure		= errors.New("godislock: refresh redis lock fail")
 	LockErrorRedisRenewalUnknownError	= errors.New("godislock: unknown error occurred in the process of releasing the redis lock")
 	LockErrorRedisTimeOut				= errors.New("godislock: Waiting for redis lock timeout. ")
+	LockErrorRedisActiveAcquire			= errors.New("godislock: Active acquire fail. ")
 )
 
 const(
@@ -27,46 +28,47 @@ const(
 
 var(
 	scriptReleaseLock = redis.NewScript(luaReleaseLock)
-	scriptRenewalLock = redis.NewScript(luaRenewalLock)
-	scriptQueueUp = redis.NewScript(luaQueueUp)
+	scriptRefreshLock = redis.NewScript(luaRefreshLock)
 	scriptReJoin = redis.NewScript(luaReAcquireLock)
+	scriptActiveAcquire = redis.NewScript(luaActiveAcquire)
 )
 
 var(
 	luaReleaseLock = `
 	-- return -1 if the token does not match
-	if (redis.call('get', KEYS[1]) ~= ARGV[1]) then 
+	if (redis.call('get', KEYS[2]) ~= ARGV[1]) then 
 		return -1
 	end
 
 	-- release lock
-	if (redis.call('del', KEYS[1]) ~= 1) then
+	if (redis.call('del', KEYS[2]) ~= 1) then
 	 	return -2
 	end
 
 	-- Publish messages to subscribers in the queue
 	local publish_count = 0
-	while(publish_count < 5)
+	while(publish_count < 3)
 	do
-		local tempToken = redis.call('lpop', KEYS[2])
+		local tempToken = redis.call('lpop', KEYS[1])
 		if not tempToken then 
 			break
 		end
+		redis.call('lrem', KEYS[1], 0, tempToken)
 
 		if redis.call('get', tempToken) == tempToken then
-			redis.call('del', tempToken)
-			if tempToken ~= ARGV[1] then
-				if redis.call('publish', tempToken, 1) == 1 then
-					publish_count = publish_count + 1
+			if redis.call('del', tempToken) == 1 then
+				if tempToken ~= ARGV[1] then
+					if redis.call('publish', tempToken, tempToken) == 1 then
+						publish_count = publish_count + 1
+					end
 				end
 			end
 		end
 	end
-
 	return 1
 	`
 
-	luaRenewalLock = `
+	luaRefreshLock = `
 	-- token不符合则返回失败
 	if (redis.call('get', KEYS[1]) ~= ARGV[1]) then 
 		return -1
@@ -74,19 +76,15 @@ var(
 	return redis.call('pexpire', KEYS[1], ARGV[2])
 	`
 
-	luaQueueUp = `
-	-- 利用string的ttl功能控制实际的排队时长
-	if not redis.call('set', KEYS[1], KEYS[1], 'nx','PX', ARGV[1]) then 
-		return -1
+	luaActiveAcquire = `
+	if(redis.call('set', KEYS[1], ARGV[1], 'nx', 'PX', ARGV[2])) then
+		redis.call('del', ARGV[1])
+		return 1
 	end
-
-	-- 加入等待队列
-	return redis.call('rpush', KEYS[2], KEYS[1])
+	return 0
 	`
 
 	luaReAcquireLock = `
-	redis.call('del', ARGV[1])
-	redis.call('lrem', KEYS[2], 0, ARGV[1])
 	-- 获取锁
 	if (redis.call('set', KEYS[1], ARGV[1], 'nx', 'PX', ARGV[2])) then
 		return 1
@@ -100,7 +98,7 @@ var(
 	if (redis.call('lpush', KEYS[2], ARGV[1]) == 0) then
 		return -2
 	end
-	
+
 	return 0
 	`
 )
